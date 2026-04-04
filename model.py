@@ -13,6 +13,9 @@ from hmmlearn.hmm import CategoricalHMM
 #   3 — server loses via double fault
 N_CATEGORIES = 4
 
+# Which observation indices represent a server win (used for P(server wins)).
+_SERVER_WIN_OBS = [0, 1]
+
 
 def encode_observations(points: pd.DataFrame) -> pd.DataFrame:
     """Convert a points DataFrame into per-point categorical observations.
@@ -193,8 +196,9 @@ def p_server_wins_point(
     """
     state_probs = posteriors[point_idx]  # shape (n_states,)
     emission = model.emissionprob_       # shape (n_states, N_CATEGORIES)
-    # P(server wins) = Σ_s P(state=s) * [P(obs=0|s) + P(obs=1|s)]
-    return float(state_probs @ (emission[:, 0] + emission[:, 1]))
+    # P(server wins) = Σ_s P(state=s) * Σ_obs_in_server_wins P(obs|s)
+    server_win_probs = emission[:, _SERVER_WIN_OBS].sum(axis=1)
+    return float(state_probs @ server_win_probs)
 
 
 def estimate_serve_return_probs(
@@ -229,7 +233,8 @@ def estimate_serve_return_probs(
     """
     emission = model.emissionprob_
     # P(server wins point) at each point, weighted by posterior
-    p_srv_win = posteriors @ (emission[:, 0] + emission[:, 1])
+    server_win_probs = emission[:, _SERVER_WIN_OBS].sum(axis=1)
+    p_srv_win = posteriors @ server_win_probs
 
     is_serving = encoded_points["PointServer"].values == player
     is_returning = np.logical_not(is_serving)
