@@ -25,6 +25,7 @@ from model import (
     score,
     train,
     N_CATEGORIES,
+    FIRST_SERVE_FREQUENCY,
 )
 
 PROJECT_DIR = os.path.dirname(__file__)
@@ -73,6 +74,16 @@ def _best_of(match_row) -> int:
     return 5 if _is_mens(match_row) else 3
 
 
+def _first_serve_pct(group) -> float:
+    """Compute 1st-serve percentage from a points group."""
+    if "ServeNumber" not in group.columns:
+        return FIRST_SERVE_FREQUENCY
+    valid = group["ServeNumber"].isin([1, 2])
+    if valid.sum() == 0:
+        return FIRST_SERVE_FREQUENCY
+    return float((group.loc[valid, "ServeNumber"] == 1).mean())
+
+
 # ---------------------------------------------------------------------------
 # Validation — odds-informed
 # ---------------------------------------------------------------------------
@@ -108,6 +119,7 @@ def evaluate(model, val_matches, val_points):
         # HMM-adjusted prediction using full match observations
         X_m = group["observation"].values.reshape(-1, 1)
         posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
+        fsp = _first_serve_pct(group)
 
         # Use final-point posterior for end-of-match assessment
         last_idx = len(X_m) - 1
@@ -118,6 +130,7 @@ def evaluate(model, val_matches, val_points):
             score={"server_serving": is_p1_serving},
             best_of=best_of,
             slam=slam,
+            first_serve_pct=fsp,
         )
 
         actual_winner = int(match_row["winner"])
@@ -168,15 +181,29 @@ def plot_win_prob_evolution(model, val_enc, val_matches):
     posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
     is_p1_serving = sample_pts["PointServer"].values == 1
 
+    # Precompute running 1st-serve percentage
+    serve_nums = sample_pts["ServeNumber"].values if "ServeNumber" in sample_pts.columns else None
+
     # Compute live win prob at each point (HMM-adjusted)
     hmm_probs = []
     # Also compute odds-only baseline (no momentum) at each point
     odds_probs = []
     for i in range(len(sample_pts)):
+        # Running 1st-serve pct up to this point
+        if serve_nums is not None:
+            valid_mask = np.isin(serve_nums[:i + 1], [1, 2])
+            if valid_mask.sum() > 0:
+                fsp = float((serve_nums[:i + 1][valid_mask] == 1).mean())
+            else:
+                fsp = FIRST_SERVE_FREQUENCY
+        else:
+            fsp = FIRST_SERVE_FREQUENCY
+
         score_dict = {"server_serving": bool(is_p1_serving[i])}
         hmm_wp = live_win_probability(
             model, posteriors, i, baseline_s, baseline_r,
             score=score_dict, best_of=best_of, slam=slam,
+            first_serve_pct=fsp,
         )
         odds_wp = match_win_probability(
             baseline_s, baseline_r, score=score_dict, best_of=best_of,

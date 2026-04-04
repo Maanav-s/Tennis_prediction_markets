@@ -461,6 +461,12 @@ SURFACE_SERVE_WIN_RATE = {
 }
 
 
+# 1st vs 2nd serve dynamics (from data analysis).
+FIRST_SERVE_WIN_RATE = 0.691
+SECOND_SERVE_WIN_RATE = 0.535
+FIRST_SERVE_FREQUENCY = 0.64   # fraction of points that are 1st serves
+
+
 def get_serve_win_rate(slam: str | None = None) -> float:
     """Return the surface-specific serve win rate, or the global average."""
     if slam is not None:
@@ -567,6 +573,30 @@ def hmm_momentum_adjustment(
     return hmm_p - get_serve_win_rate(slam)
 
 
+def adjust_baseline_for_serve_mix(
+    baseline_serve: float,
+    baseline_return: float,
+    first_serve_pct: float,
+) -> tuple[float, float]:
+    """Adjust baseline serve/return rates for observed 1st-serve frequency.
+
+    If a player is landing more 1st serves than average, their effective
+    serve-win rate is higher.  This computes the delta between the expected
+    serve-win rate at the average 1st-serve frequency and at the observed
+    frequency, and applies it to the baseline serve rate.
+
+    The return rate is not adjusted (the opponent's serve mix is independent).
+    """
+    expected = (FIRST_SERVE_FREQUENCY * FIRST_SERVE_WIN_RATE
+                + (1 - FIRST_SERVE_FREQUENCY) * SECOND_SERVE_WIN_RATE)
+    actual = (first_serve_pct * FIRST_SERVE_WIN_RATE
+              + (1 - first_serve_pct) * SECOND_SERVE_WIN_RATE)
+    delta = actual - expected
+
+    adj_serve = float(np.clip(baseline_serve + delta, 0.01, 0.99))
+    return adj_serve, baseline_return
+
+
 def live_win_probability(
     model: CategoricalHMM,
     posteriors: np.ndarray,
@@ -576,6 +606,7 @@ def live_win_probability(
     score: dict,
     best_of: int = 5,
     slam: str | None = None,
+    first_serve_pct: float | None = None,
 ) -> float:
     """Compute live P(P1 wins match) combining odds baseline + HMM momentum.
 
@@ -603,12 +634,21 @@ def live_win_probability(
         3 or 5.
     slam : str, optional
         Tournament name for surface-specific momentum reference.
+    first_serve_pct : float, optional
+        Observed 1st-serve percentage so far.  When provided, adjusts the
+        baseline serve rate for the player's serve mix.
 
     Returns
     -------
     float
         P(P1 wins match) incorporating momentum and current score.
     """
+    # Adjust baseline for serve mix if available
+    if first_serve_pct is not None:
+        baseline_serve, baseline_return = adjust_baseline_for_serve_mix(
+            baseline_serve, baseline_return, first_serve_pct,
+        )
+
     delta = hmm_momentum_adjustment(model, posteriors, point_idx, slam=slam)
 
     # Apply momentum: if P1 is serving and "hot", their serve rate goes up;
@@ -617,11 +657,9 @@ def live_win_probability(
     is_p1_serving = score.get("server_serving", True)
 
     if is_p1_serving:
-        # Server is hot/cold → P1's serve ability shifts
         adj_serve = np.clip(baseline_serve + delta, 0.01, 0.99)
         adj_return = baseline_return
     else:
-        # Server (P2) is hot/cold → P1's return ability shifts inversely
         adj_serve = baseline_serve
         adj_return = np.clip(baseline_return - delta, 0.01, 0.99)
 
