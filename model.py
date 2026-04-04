@@ -444,15 +444,30 @@ def match_win_probability(
 # the global average.
 # ---------------------------------------------------------------------------
 
-# Global average P(server wins point) across the dataset.
-# Used as the neutral reference for HMM momentum adjustments.
+# Average P(server wins point) — global and per-surface.
+# Used as the neutral reference for odds inversion and HMM momentum.
 GLOBAL_SERVE_WIN_RATE = 0.6125
+
+SURFACE_SERVE_WIN_RATE = {
+    "wimbledon": 0.6598,    # grass — highest serve advantage
+    "usopen": 0.6322,       # hard (DecoTurf)
+    "ausopen": 0.6393,      # hard (GreenSet/Plexicushion)
+    "frenchopen": 0.6193,   # clay — lowest serve advantage
+}
+
+
+def get_serve_win_rate(slam: str | None = None) -> float:
+    """Return the surface-specific serve win rate, or the global average."""
+    if slam is not None:
+        return SURFACE_SERVE_WIN_RATE.get(slam, GLOBAL_SERVE_WIN_RATE)
+    return GLOBAL_SERVE_WIN_RATE
 
 
 def invert_match_odds(
     implied_p1_prob: float,
     best_of: int = 5,
-    base_serve: float = GLOBAL_SERVE_WIN_RATE,
+    base_serve: float | None = None,
+    slam: str | None = None,
     tol: float = 1e-6,
     max_iter: int = 100,
 ) -> tuple[float, float]:
@@ -475,8 +490,10 @@ def invert_match_odds(
         Market-implied probability that player 1 wins the match.
     best_of : int
         3 or 5.
-    base_serve : float
-        Neutral serve-win rate (default: global average).
+    base_serve : float, optional
+        Neutral serve-win rate.  If None, uses surface-specific rate.
+    slam : str, optional
+        Tournament name for surface-specific base rate.
     tol : float
         Convergence tolerance.
     max_iter : int
@@ -489,6 +506,9 @@ def invert_match_odds(
     p_return : float
         P(P1 wins a point when returning).
     """
+    if base_serve is None:
+        base_serve = get_serve_win_rate(slam)
+
     # delta range: p_serve and p_return must stay in (0.01, 0.99)
     lo = max(-base_serve + 0.01, -(1 - base_serve) + 0.01)
     hi = min(1 - base_serve - 0.01, 1 - (1 - base_serve) - 0.01)
@@ -514,12 +534,13 @@ def hmm_momentum_adjustment(
     model: CategoricalHMM,
     posteriors: np.ndarray,
     point_idx: int,
+    slam: str | None = None,
 ) -> float:
     """Compute the HMM momentum adjustment at a specific point.
 
     Returns the difference between the HMM's posterior-weighted
-    P(server wins) and the global average.  Positive means the server
-    is performing above average ("hot"); negative means below ("cold").
+    P(server wins) and the surface-specific average.  Positive means the
+    server is performing above average ("hot"); negative means below ("cold").
 
     Parameters
     ----------
@@ -529,6 +550,8 @@ def hmm_momentum_adjustment(
         Posterior state probabilities for this match.
     point_idx : int
         Which point to evaluate.
+    slam : str, optional
+        Tournament name (e.g. "wimbledon") for surface-specific reference.
 
     Returns
     -------
@@ -536,7 +559,7 @@ def hmm_momentum_adjustment(
         Adjustment to add to baseline serve/return rates.
     """
     hmm_p = p_server_wins_point(model, posteriors, point_idx)
-    return hmm_p - GLOBAL_SERVE_WIN_RATE
+    return hmm_p - get_serve_win_rate(slam)
 
 
 def live_win_probability(
@@ -547,11 +570,12 @@ def live_win_probability(
     baseline_return: float,
     score: dict,
     best_of: int = 5,
+    slam: str | None = None,
 ) -> float:
     """Compute live P(P1 wins match) combining odds baseline + HMM momentum.
 
     At each point the HMM detects whether the server is performing above
-    or below the global average.  That momentum shift is applied
+    or below the surface average.  That momentum shift is applied
     symmetrically to P1's baseline serve and return rates, then the
     analytical score model converts to a match-win probability at the
     current score.
@@ -572,13 +596,15 @@ def live_win_probability(
         Current match score (see ``match_win_probability``).
     best_of : int
         3 or 5.
+    slam : str, optional
+        Tournament name for surface-specific momentum reference.
 
     Returns
     -------
     float
         P(P1 wins match) incorporating momentum and current score.
     """
-    delta = hmm_momentum_adjustment(model, posteriors, point_idx)
+    delta = hmm_momentum_adjustment(model, posteriors, point_idx, slam=slam)
 
     # Apply momentum: if P1 is serving and "hot", their serve rate goes up;
     # if P1 is returning and server is "hot", P1's return rate goes down.

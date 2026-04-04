@@ -4,8 +4,7 @@
 /data/tennis-data-co-uk/*
 !/data/tennis-data-co-uk/.gitkeep
 
-# Model artifacts
-/models/
+# Model artifacts — tracked in git for version control
 
 # Python
 __pycache__/
