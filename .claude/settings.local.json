@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where conda:*)",
+      "Bash(cmd.exe /c \"conda --version\")",
+      "Bash(cmd.exe /c \"conda run -n tennisvenv python -c \\\\\"import pandas as pd; print\\(pd.__version__\\)\\\\\"\")",
+      "Bash(cmd.exe /c \"conda run -n tennisvenv python -c \\\\\"import pandas; print\\(pandas.__version__\\)\\\\\"\")",
+      "Bash(/c/Users/Maanav/miniconda3/envs/tennisvenv/python.exe -c \"import pandas; print\\(pandas.__version__\\)\")",
+      "Bash(/c/Users/Maanav/anaconda3/envs/tennisvenv/python.exe -c \"import pandas; print\\(pandas.__version__\\)\")",
+      "Read(//c/Users/Maanav/**)",
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -c ':*)",
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -c 'import hmmlearn; print\\(hmmlearn.__version__\\)')",
+      "Bash(ls \"c:/Users/Maanav/OneDrive - The University of Texas at Austin/UCF/Repositories/Tennis_Prediction_Market_Trader/Tennis_prediction_markets/\"*.py)",
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe main.py --retrain)",
+      "Bash(ls \"c:/Users/Maanav/OneDrive - The University of Texas at Austin/UCF/Repositories/Tennis_Prediction_Market_Trader/Tennis_prediction_markets/data/\"*matches*.csv)",
+      "WebFetch(domain:www.tennis-data.co.uk)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:old.datahub.io)",
+      "WebFetch(domain:tennis-data.co.uk)",
+      "WebFetch(domain:www.coursehero.com)",
+      "WebFetch(domain:zenodo.org)",
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -m pip install xlrd openpyxl)"
+    ]
+  }
+}
