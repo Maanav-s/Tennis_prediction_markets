@@ -1,63 +1,76 @@
 import numpy as np
 import pandas as pd
-from hmmlearn.hmm import CategoricalHMM
+from hmmlearn.hmm import GaussianHMM
 
 # ---------------------------------------------------------------------------
 # Observation encoding
 # ---------------------------------------------------------------------------
-# Each point is encoded from the *server's* perspective into one of four
-# discrete categories so the model is player-agnostic:
-#   0 — server wins the point (normal rally)
-#   1 — server wins via ace
-#   2 — server loses the point (normal rally)
-#   3 — server loses via double fault
-N_CATEGORIES = 4
-
-# Which observation indices represent a server win (used for P(server wins)).
-_SERVER_WIN_OBS = [0, 1]
+# Each point is encoded from the *server's* perspective into a feature vector
+# for GaussianHMM.  Features (all binary, from server's perspective):
+#   0 — server_won      (1 if server won the point)
+#   1 — was_ace          (1 if point was an ace)
+#   2 — was_double_fault (1 if point was a double fault)
+#   3 — is_second_serve  (1 if 2nd serve, 0 if 1st or unknown)
+N_FEATURES = 4
+FEATURE_NAMES = ["Server Won", "Ace", "Double Fault", "2nd Serve"]
 
 
 def encode_observations(points: pd.DataFrame) -> pd.DataFrame:
-    """Convert a points DataFrame into per-point categorical observations.
+    """Convert a points DataFrame into per-point feature observations.
 
-    Filters out non-point rows (PointWinner == 0 / NaN) and adds an integer
-    ``observation`` column encoded from the server's perspective.
+    Filters out non-point rows (PointWinner == 0 / NaN) and adds feature
+    columns from the server's perspective.
 
-    Returns a copy with only actual points and the new column appended.
+    Returns a copy with only actual points and new columns appended.
     """
     df = points[points["PointWinner"].isin([1, 2])].copy()
 
     is_p1_serving = df["PointServer"] == 1
-    server_won = df["PointWinner"] == df["PointServer"]
-    server_ace = np.where(is_p1_serving, df["P1Ace"], df["P2Ace"]).astype(bool)
+    server_won = (df["PointWinner"] == df["PointServer"]).astype(int)
+    server_ace = np.where(is_p1_serving, df["P1Ace"], df["P2Ace"]).astype(int)
     server_df = np.where(
         is_p1_serving, df["P1DoubleFault"], df["P2DoubleFault"]
-    ).astype(bool)
+    ).astype(int)
+    is_second = (
+        (df["ServeNumber"].values == 2).astype(int)
+        if "ServeNumber" in df.columns
+        else np.zeros(len(df), dtype=int)
+    )
 
-    obs = np.full(len(df), 2, dtype=int)  # default: server loses (normal)
-    obs[server_won & ~server_ace] = 0     # server wins (normal)
-    obs[server_won & server_ace] = 1      # server wins via ace
-    obs[~server_won & server_df] = 3      # server loses via double fault
+    df["feat_server_won"] = server_won.values
+    df["feat_ace"] = server_ace
+    df["feat_double_fault"] = server_df
+    df["feat_second_serve"] = is_second
 
+    # Keep observation column for backward compat (used by some viz)
+    obs = np.full(len(df), 2, dtype=int)
+    obs[server_won.values.astype(bool) & ~server_ace.astype(bool)] = 0
+    obs[server_won.values.astype(bool) & server_ace.astype(bool)] = 1
+    obs[~server_won.values.astype(bool) & server_df.astype(bool)] = 3
     df["observation"] = obs
+
     return df
+
+
+def build_feature_matrix(encoded_points: pd.DataFrame) -> np.ndarray:
+    """Extract the feature matrix from encoded points.
+
+    Returns
+    -------
+    np.ndarray, shape (n_points, N_FEATURES)
+    """
+    return encoded_points[
+        ["feat_server_won", "feat_ace", "feat_double_fault", "feat_second_serve"]
+    ].values.astype(np.float64)
 
 
 def build_sequences(encoded_points: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Group encoded points into per-match sequences for hmmlearn.
 
-    Parameters
-    ----------
-    encoded_points : pd.DataFrame
-        Output of ``encode_observations`` (must have ``match_id`` and
-        ``observation`` columns, with rows sorted by point order within
-        each match).
-
     Returns
     -------
-    X : np.ndarray, shape (total_points, 1)
-        Concatenated observation sequences (column vector as required by
-        hmmlearn).
+    X : np.ndarray, shape (total_points, N_FEATURES)
+        Concatenated feature vectors.
     lengths : np.ndarray, shape (n_matches,)
         Number of points in each match sequence.
     """
@@ -65,11 +78,11 @@ def build_sequences(encoded_points: pd.DataFrame) -> tuple[np.ndarray, np.ndarra
     sequences = []
     lengths = []
     for _, group in grouped:
-        obs = group["observation"].values
-        sequences.append(obs)
-        lengths.append(len(obs))
+        feat = build_feature_matrix(group)
+        sequences.append(feat)
+        lengths.append(len(feat))
 
-    X = np.concatenate(sequences).reshape(-1, 1)
+    X = np.vstack(sequences)
     lengths = np.array(lengths, dtype=int)
     return X, lengths
 
@@ -83,13 +96,13 @@ def create_model(
     n_iter: int = 100,
     tol: float = 1e-4,
     random_state: int = 42,
-) -> CategoricalHMM:
-    """Instantiate an untrained CategoricalHMM.
+) -> GaussianHMM:
+    """Instantiate an untrained GaussianHMM with diagonal covariance.
 
     Parameters
     ----------
     n_states : int
-        Number of hidden states (default 2: e.g. "cold" vs "hot").
+        Number of hidden states (default 3).
     n_iter : int
         Maximum EM iterations.
     tol : float
@@ -97,9 +110,9 @@ def create_model(
     random_state : int
         Seed for reproducibility.
     """
-    model = CategoricalHMM(
+    model = GaussianHMM(
         n_components=n_states,
-        n_features=N_CATEGORIES,
+        covariance_type="diag",
         n_iter=n_iter,
         tol=tol,
         random_state=random_state,
@@ -108,49 +121,27 @@ def create_model(
 
 
 def train(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     X: np.ndarray,
     lengths: np.ndarray,
-) -> CategoricalHMM:
-    """Fit the HMM on training sequences via Baum-Welch (EM).
-
-    Parameters
-    ----------
-    model : CategoricalHMM
-        An untrained model from ``create_model``.
-    X : np.ndarray
-        Concatenated observations from ``build_sequences``.
-    lengths : np.ndarray
-        Per-match sequence lengths from ``build_sequences``.
-
-    Returns
-    -------
-    The fitted model (same object, returned for convenience).
-    """
+) -> GaussianHMM:
+    """Fit the HMM on training sequences via Baum-Welch (EM)."""
     model.fit(X, lengths)
     return model
 
 
 def decode(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     X: np.ndarray,
     lengths: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run Viterbi decoding to find the most likely hidden state sequence.
-
-    Returns
-    -------
-    log_probs : np.ndarray, shape (n_matches,)
-        Log-probability of each match's observation sequence under the model.
-    state_sequences : np.ndarray, shape (total_points,)
-        Most likely hidden state at each point (concatenated across matches).
-    """
+    """Run Viterbi decoding to find the most likely hidden state sequence."""
     log_prob, states = model.decode(X, lengths)
     return log_prob, states
 
 
 def score(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     X: np.ndarray,
     lengths: np.ndarray,
 ) -> float:
@@ -159,17 +150,11 @@ def score(
 
 
 def predict_proba(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     X: np.ndarray,
     lengths: np.ndarray,
 ) -> np.ndarray:
-    """Compute posterior state probabilities for each point.
-
-    Returns
-    -------
-    posteriors : np.ndarray, shape (total_points, n_states)
-        posteriors[t, s] = P(hidden_state=s | observations) at point t.
-    """
+    """Compute posterior state probabilities for each point."""
     return model.predict_proba(X, lengths)
 
 
@@ -185,24 +170,23 @@ from functools import lru_cache
 
 
 def p_server_wins_point(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     posteriors: np.ndarray,
     point_idx: int,
 ) -> float:
     """Server win probability at a specific point, given HMM posteriors.
 
-    Combines emission probabilities (obs 0 = server win, obs 1 = ace) weighted
-    by the posterior state distribution at ``point_idx``.
+    For GaussianHMM, feature 0 is ``server_won``.  The mean of this feature
+    per state approximates P(server wins | state).  We weight by the
+    posterior state distribution.
     """
-    state_probs = posteriors[point_idx]  # shape (n_states,)
-    emission = model.emissionprob_       # shape (n_states, N_CATEGORIES)
-    # P(server wins) = Σ_s P(state=s) * Σ_obs_in_server_wins P(obs|s)
-    server_win_probs = emission[:, _SERVER_WIN_OBS].sum(axis=1)
-    return float(state_probs @ server_win_probs)
+    state_probs = posteriors[point_idx]       # shape (n_states,)
+    server_win_means = model.means_[:, 0]     # shape (n_states,)
+    return float(np.clip(state_probs @ server_win_means, 0.0, 1.0))
 
 
 def estimate_serve_return_probs(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     encoded_points: pd.DataFrame,
     posteriors: np.ndarray,
     player: int,
@@ -214,7 +198,7 @@ def estimate_serve_return_probs(
 
     Parameters
     ----------
-    model : CategoricalHMM
+    model : GaussianHMM
         A fitted model.
     encoded_points : pd.DataFrame
         Encoded points for a single match (from ``encode_observations``).
@@ -231,10 +215,9 @@ def estimate_serve_return_probs(
     p_return : float
         P(player wins a point when returning).
     """
-    emission = model.emissionprob_
+    server_win_means = model.means_[:, 0]
     # P(server wins point) at each point, weighted by posterior
-    server_win_probs = emission[:, _SERVER_WIN_OBS].sum(axis=1)
-    p_srv_win = posteriors @ server_win_probs
+    p_srv_win = np.clip(posteriors @ server_win_means, 0.0, 1.0)
 
     is_serving = encoded_points["PointServer"].values == player
     is_returning = np.logical_not(is_serving)
@@ -536,7 +519,7 @@ def invert_match_odds(
 
 
 def hmm_momentum_adjustment(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     posteriors: np.ndarray,
     point_idx: int,
     slam: str | None = None,
@@ -549,7 +532,7 @@ def hmm_momentum_adjustment(
 
     Parameters
     ----------
-    model : CategoricalHMM
+    model : GaussianHMM
         A fitted model.
     posteriors : np.ndarray, shape (n_points, n_states)
         Posterior state probabilities for this match.
@@ -568,7 +551,7 @@ def hmm_momentum_adjustment(
 
 
 def live_win_probability(
-    model: CategoricalHMM,
+    model: GaussianHMM,
     posteriors: np.ndarray,
     point_idx: int,
     baseline_serve: float,
@@ -587,7 +570,7 @@ def live_win_probability(
 
     Parameters
     ----------
-    model : CategoricalHMM
+    model : GaussianHMM
         A fitted model.
     posteriors : np.ndarray, shape (n_points, n_states)
         Posterior state probabilities for this match.
@@ -630,7 +613,7 @@ def live_win_probability(
     )
 
 
-def get_model_params(model: CategoricalHMM) -> dict:
+def get_model_params(model: GaussianHMM) -> dict:
     """Extract learned model parameters as a plain dict.
 
     Keys
@@ -639,12 +622,14 @@ def get_model_params(model: CategoricalHMM) -> dict:
         Initial state distribution.
     transmat : np.ndarray, shape (n_states, n_states)
         State transition probabilities.
-    emissionprob : np.ndarray, shape (n_states, N_CATEGORIES)
-        Per-state observation probabilities (columns ordered as
-        server-win-normal, ace, server-loss-normal, double-fault).
+    means : np.ndarray, shape (n_states, N_FEATURES)
+        Per-state feature means (server_won, ace, double_fault, 2nd_serve).
+    covars : np.ndarray, shape (n_states, N_FEATURES)
+        Per-state feature variances (diagonal covariance).
     """
     return {
         "startprob": model.startprob_,
         "transmat": model.transmat_,
-        "emissionprob": model.emissionprob_,
+        "means": model.means_,
+        "covars": model.covars_,
     }

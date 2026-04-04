@@ -12,6 +12,7 @@ from dataservice import (
     train_val_split,
 )
 from model import (
+    build_feature_matrix,
     build_sequences,
     create_model,
     decode,
@@ -24,7 +25,8 @@ from model import (
     predict_proba,
     score,
     train,
-    N_CATEGORIES,
+    N_FEATURES,
+    FEATURE_NAMES,
 )
 
 PROJECT_DIR = os.path.dirname(__file__)
@@ -32,7 +34,7 @@ MODELS_DIR = os.path.join(PROJECT_DIR, "models")
 MODEL_PATH = os.path.join(MODELS_DIR, "hmm_model.pkl")
 FIGURES_DIR = os.path.join(PROJECT_DIR, "figures")
 
-OBS_LABELS = ["Server Win", "Ace", "Server Loss", "Double Fault"]
+OBS_LABELS = FEATURE_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +108,7 @@ def evaluate(model, val_matches, val_points):
         )
 
         # HMM-adjusted prediction using full match observations
-        X_m = group["observation"].values.reshape(-1, 1)
+        X_m = build_feature_matrix(group)
         posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
 
         # Use final-point posterior for end-of-match assessment
@@ -164,7 +166,7 @@ def plot_win_prob_evolution(model, val_enc, val_matches):
         implied_prob, best_of=best_of, slam=slam,
     )
 
-    X_m = sample_pts["observation"].values.reshape(-1, 1)
+    X_m = build_feature_matrix(sample_pts)
     posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
     is_p1_serving = sample_pts["PointServer"].values == 1
 
@@ -278,23 +280,23 @@ def plot_hmm_vs_odds(eval_df):
 def plot_model_states(model):
     """Visualize the HMM's learned parameters: emissions, transitions, start probs."""
     params = get_model_params(model)
-    n_states = params["emissionprob"].shape[0]
+    n_states = params["means"].shape[0]
     state_labels = [f"State {i}" for i in range(n_states)]
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
-    # 1) Emission probabilities
+    # 1) Feature means per state
     ax = axes[0]
-    x = np.arange(N_CATEGORIES)
+    x = np.arange(N_FEATURES)
     width = 0.8 / n_states
     colors = plt.cm.Set2(np.linspace(0, 0.6, n_states))
     for s in range(n_states):
-        ax.bar(x + s * width, params["emissionprob"][s], width,
+        ax.bar(x + s * width, params["means"][s], width,
                label=state_labels[s], color=colors[s], edgecolor="white")
     ax.set_xticks(x + width * (n_states - 1) / 2)
     ax.set_xticklabels(OBS_LABELS, fontsize=9)
-    ax.set_ylabel("Probability")
-    ax.set_title("Emission Probabilities")
+    ax.set_ylabel("Mean Value")
+    ax.set_title("Feature Means per State")
     ax.legend(fontsize=8)
 
     # 2) Transition matrix
@@ -322,7 +324,7 @@ def plot_model_states(model):
     ax.set_title("Initial State Distribution")
     ax.set_ylim(0, 1.1)
 
-    fig.suptitle("HMM Learned Parameters (3 Hidden States)", fontsize=13, y=1.02)
+    fig.suptitle("GaussianHMM Learned Parameters (3 Hidden States)", fontsize=13, y=1.02)
     fig.tight_layout()
     fig.savefig(os.path.join(FIGURES_DIR, "model_states.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -344,7 +346,7 @@ def plot_state_timeline(model, val_enc, val_matches):
 
     slam = match_row.get("slam")
 
-    X_m = sample_pts["observation"].values.reshape(-1, 1)
+    X_m = build_feature_matrix(sample_pts)
     _, states = decode(model, X_m, np.array([len(X_m)]))
     posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
 
