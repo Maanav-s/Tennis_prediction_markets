@@ -24,7 +24,9 @@
       "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -m pip install xlrd openpyxl)",
       "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe main.py)",
       "WebFetch(domain:docs.kalshi.com)",
-      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -m pip install cryptography)"
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -m pip install cryptography)",
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe live-test.py)",
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe live-test.py scraper/data/KXATPCHALLENGERMATCH-26APR05HARMAR-HAR.csv)"
     ]
   }
 }

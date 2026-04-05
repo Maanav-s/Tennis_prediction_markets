@@ -597,6 +597,36 @@ def adjust_baseline_for_serve_mix(
     return adj_serve, baseline_return
 
 
+def recalibrate_baseline(
+    market_prob: float,
+    best_of: int = 3,
+    slam: str | None = None,
+) -> tuple[float, float]:
+    """Re-anchor baseline serve/return rates to the current market price.
+
+    Instead of using pre-match odds for the entire match, periodically
+    re-invert the live market probability to get updated baseline rates.
+    This lets the HMM focus on detecting *short-term momentum shifts*
+    relative to what the market currently believes, rather than drifting
+    from stale pre-match odds.
+
+    Parameters
+    ----------
+    market_prob : float
+        Current market-implied P(player wins match).
+    best_of : int
+        3 or 5.
+    slam : str, optional
+        Tournament for surface-specific base rate.
+
+    Returns
+    -------
+    p_serve, p_return : float
+        Re-calibrated baseline rates.
+    """
+    return invert_match_odds(market_prob, best_of=best_of, slam=slam)
+
+
 def live_win_probability(
     model: CategoricalHMM,
     posteriors: np.ndarray,
@@ -607,14 +637,15 @@ def live_win_probability(
     best_of: int = 5,
     slam: str | None = None,
     first_serve_pct: float | None = None,
+    market_prob: float | None = None,
+    confidence_halflife: int = 30,
 ) -> float:
     """Compute live P(P1 wins match) combining odds baseline + HMM momentum.
 
     At each point the HMM detects whether the server is performing above
-    or below the surface average.  That momentum shift is applied
-    symmetrically to P1's baseline serve and return rates, then the
-    analytical score model converts to a match-win probability at the
-    current score.
+    or below the surface average.  That momentum shift is scaled by a
+    confidence weight that grows as the HMM sees more points, then applied
+    to P1's baseline serve and return rates.
 
     Parameters
     ----------
@@ -637,12 +668,28 @@ def live_win_probability(
     first_serve_pct : float, optional
         Observed 1st-serve percentage so far.  When provided, adjusts the
         baseline serve rate for the player's serve mix.
+    market_prob : float, optional
+        Current market price for this player.  When provided, re-anchors
+        the baseline to the market's current view so the HMM only detects
+        *deviations* from the market rather than maintaining an independent
+        estimate.
+    confidence_halflife : int
+        Number of points after which the HMM confidence reaches 50%.
+        At point 0 the model fully trusts the market; the HMM's influence
+        grows as 1 - 0.5^(n_points / halflife).  Default 30 (~1 set).
 
     Returns
     -------
     float
         P(P1 wins match) incorporating momentum and current score.
     """
+    # Re-anchor baseline to current market price if available
+    if market_prob is not None:
+        market_prob = float(np.clip(market_prob, 0.02, 0.98))
+        baseline_serve, baseline_return = recalibrate_baseline(
+            market_prob, best_of=best_of, slam=slam,
+        )
+
     # Adjust baseline for serve mix if available
     if first_serve_pct is not None:
         baseline_serve, baseline_return = adjust_baseline_for_serve_mix(
@@ -653,7 +700,6 @@ def live_win_probability(
 
     # Apply momentum: if P1 is serving and "hot", their serve rate goes up;
     # if P1 is returning and server is "hot", P1's return rate goes down.
-    # We apply the adjustment from P1's perspective based on who is serving.
     is_p1_serving = score.get("server_serving", True)
 
     if is_p1_serving:
@@ -663,9 +709,19 @@ def live_win_probability(
         adj_serve = baseline_serve
         adj_return = np.clip(baseline_return - delta, 0.01, 0.99)
 
-    return match_win_probability(
+    hmm_result = match_win_probability(
         float(adj_serve), float(adj_return), score=score, best_of=best_of
     )
+
+    # Confidence decay: blend between raw market price and HMM-adjusted
+    # result.  Early in the match, trust the market more; as points
+    # accumulate, trust the HMM's momentum signal more.
+    if market_prob is not None:
+        n_points = point_idx + 1
+        confidence = 1.0 - 0.5 ** (n_points / confidence_halflife)
+        return confidence * hmm_result + (1 - confidence) * market_prob
+
+    return hmm_result
 
 
 def get_model_params(model: CategoricalHMM) -> dict:

@@ -23,7 +23,6 @@ import time
 from datetime import datetime, timezone
 
 import requests
-import websockets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from dotenv import load_dotenv
@@ -43,7 +42,6 @@ else:
     KALSHI_REST_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 
 API_TENNIS_REST = "https://api.api-tennis.com/tennis/"
-API_TENNIS_WS = "wss://wss.api-tennis.com/live"
 
 
 # ---------------------------------------------------------------------------
@@ -254,111 +252,130 @@ async def kalshi_poll(ticker: str, logger: DataLogger, stop_event: asyncio.Event
 
 
 # ---------------------------------------------------------------------------
-# API-Tennis websocket
+# API-Tennis polling
 # ---------------------------------------------------------------------------
 
-async def tennis_ws(match_key: str, logger: DataLogger, stop_event: asyncio.Event):
-    """Connect to API-Tennis websocket and log point-by-point updates."""
-    url = f"{API_TENNIS_WS}?APIkey={API_TENNIS_KEY}&match_key={match_key}"
+TENNIS_POLL_INTERVAL = 4  # seconds
 
-    # Will be set from the first websocket message so we don't replay old points
-    prev_point_count = None
+async def tennis_poll(match_key: str, logger: DataLogger, stop_event: asyncio.Event):
+    """Poll API-Tennis REST API for live score updates."""
+    prev_state = None  # (set_score, games_in_set, game_score) tuple
 
+    print(f"[Tennis] Polling every {TENNIS_POLL_INTERVAL}s for match {match_key}")
+
+    poll_count = 0
     while not stop_event.is_set():
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                print(f"[Tennis] Connected for match {match_key}")
+            # Run blocking HTTP request in a thread so it doesn't stall Kalshi polling
+            loop = asyncio.get_event_loop()
+            r = await loop.run_in_executor(None, lambda: requests.get(
+                API_TENNIS_REST, params={
+                    "method": "get_livescore",
+                    "APIkey": API_TENNIS_KEY,
+                    "match_key": match_key,
+                }, timeout=10,
+            ))
+            poll_count += 1
 
-                async for msg in ws:
-                    if stop_event.is_set():
-                        break
-                    try:
-                        data = json.loads(msg)
-                        matches = data if isinstance(data, list) else [data]
+            if r.status_code != 200:
+                print(f"[Tennis] HTTP {r.status_code}")
+                await asyncio.sleep(TENNIS_POLL_INTERVAL)
+                continue
 
-                        for match in matches:
-                            event_key = match.get("event_key")
-                            if str(event_key) != str(match_key):
-                                continue
+            data = r.json()
+            matches = data.get("result", [])
+            if not matches:
+                await asyncio.sleep(TENNIS_POLL_INTERVAL)
+                continue
 
-                            set_score = match.get("event_final_result", "")
-                            game_score = match.get("event_game_result", "")
-                            server = match.get("event_serve", "")
+            match = matches[0]
+            set_score = match.get("event_final_result", "")
+            game_score = match.get("event_game_result", "")
+            server = match.get("event_serve", "")
+            status = match.get("event_status", "")
 
-                            # Extract latest point from pointbypoint
-                            pbp = match.get("pointbypoint", [])
-                            total_points = sum(
-                                len(g.get("points", []))
-                                for g in pbp
-                            )
+            # Extract current games-in-set from scores array
+            scores = match.get("scores", [])
+            if scores:
+                last_set = scores[-1]
+                games_in_set = f"{last_set.get('score_first', 0)} - {last_set.get('score_second', 0)}"
+            else:
+                games_in_set = "0 - 0"
 
-                            if prev_point_count is None:
-                                # First message — snapshot current state
-                                prev_point_count = total_points
-                                logger.log({
-                                    "source": "tennis",
-                                    "event_type": "snapshot",
-                                    "set_score": set_score,
-                                    "game_score": game_score,
-                                    "server": server,
-                                    "raw": json.dumps(match),
-                                })
-                                print(
-                                    f"[Tennis] Snapshot: {game_score} "
-                                    f"(Set: {set_score}) "
-                                    f"Total points so far: {total_points}"
-                                )
-                                continue
+            # Detect score changes using the live score fields directly,
+            # not pointbypoint (which lags behind)
+            cur_state = (set_score, games_in_set, game_score)
 
-                            if total_points > prev_point_count and pbp:
-                                # New point(s) scored — log the latest
-                                last_game = pbp[-1]
-                                points = last_game.get("points", [])
-                                last_point = points[-1] if points else {}
+            if prev_state is None:
+                # First poll — snapshot
+                prev_state = cur_state
+                logger.log({
+                    "source": "tennis",
+                    "event_type": "snapshot",
+                    "set_score": set_score,
+                    "game_score": games_in_set,
+                    "point_score": game_score,
+                    "server": server,
+                    "raw": json.dumps(match),
+                })
+                print(
+                    f"[Tennis] Snapshot: Games {games_in_set} "
+                    f"Score {game_score} "
+                    f"(Sets: {set_score}) "
+                    f"Server: {server}"
+                )
 
-                                logger.log({
-                                    "source": "tennis",
-                                    "event_type": "point",
-                                    "set_score": set_score,
-                                    "game_score": game_score,
-                                    "point_score": last_point.get("score", ""),
-                                    "server": last_game.get("player_served", server),
-                                    "point_winner": last_game.get("serve_winner", ""),
-                                    "set_number": last_game.get("set_number", ""),
-                                    "game_number": last_game.get("number_game", ""),
-                                    "point_number": last_point.get("number_point", ""),
-                                    "break_point": last_point.get("break_point", ""),
-                                    "set_point": last_point.get("set_point", ""),
-                                    "match_point": last_point.get("match_point", ""),
-                                    "raw": json.dumps(match),
-                                })
-                                prev_point_count = total_points
+            elif cur_state != prev_state:
+                # Score changed — log as point
+                # Determine if server won by comparing game_score movement
+                prev_set, prev_games, _ = prev_state
 
-                                print(
-                                    f"[Tennis] Point: {game_score} "
-                                    f"(Set: {set_score}) "
-                                    f"Server: {server}"
-                                )
-                            elif total_points == prev_point_count:
-                                # Heartbeat / status update — log game changes
-                                status = match.get("event_status", "")
-                                logger.log({
-                                    "source": "tennis",
-                                    "event_type": "status",
-                                    "set_score": set_score,
-                                    "game_score": game_score,
-                                    "server": server,
-                                    "raw": json.dumps({"status": status, "score": set_score}),
-                                })
+                # Detect who won: if set/game score changed, it was a game/set win
+                # For point-level: compare point scores
+                event_type = "point"
+                if set_score != prev_set:
+                    event_type = "set"
+                elif games_in_set != prev_games:
+                    event_type = "game"
 
-                    except json.JSONDecodeError:
-                        pass
+                logger.log({
+                    "source": "tennis",
+                    "event_type": event_type,
+                    "set_score": set_score,
+                    "game_score": games_in_set,
+                    "point_score": game_score,
+                    "server": server,
+                    "raw": json.dumps(match),
+                })
+                prev_state = cur_state
 
-        except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
-            if stop_event.is_set():
+                print(
+                    f"[Tennis] {event_type.upper()}: Games {games_in_set} "
+                    f"Score {game_score} "
+                    f"(Sets: {set_score}) "
+                    f"Server: {server}"
+                )
+
+            else:
+                # No change — periodic heartbeat every ~30s
+                if poll_count % 8 == 0:
+                    print(
+                        f"[Tennis] Waiting... Games {games_in_set} "
+                        f"Score {game_score} "
+                        f"(Sets: {set_score})"
+                    )
+
+            # Check if match is finished
+            if status.lower() in ("finished", "ended", "completed"):
+                winner = match.get("event_winner", "")
+                print(f"[Tennis] Match finished. Winner: {winner}")
+                stop_event.set()
                 break
-            print(f"[Tennis] Connection lost ({e}), reconnecting in 5s...")
-            await asyncio.sleep(5)
+
+        except Exception as e:
+            print(f"[Tennis] Poll error: {e}")
+
+        await asyncio.sleep(TENNIS_POLL_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +388,7 @@ async def run(kalshi_ticker: str, tennis_match_key: str, logger: DataLogger):
     try:
         await asyncio.gather(
             kalshi_poll(kalshi_ticker, logger, stop_event),
-            tennis_ws(tennis_match_key, logger, stop_event),
+            tennis_poll(tennis_match_key, logger, stop_event),
         )
     except KeyboardInterrupt:
         stop_event.set()
