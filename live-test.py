@@ -140,6 +140,8 @@ def build_observations_from_events(
     """
     rows = []
     prev_point_score = None
+    prev_sets = (0, 0)
+    prev_games = (0, 0)
 
     for _, ev in score_events.iterrows():
         server_str = str(ev.get("server", ""))
@@ -150,9 +152,6 @@ def build_observations_from_events(
 
         # Infer winner
         if event_type in ("game", "set"):
-            # A game/set boundary — the server of the previous game won or lost
-            # Score reset to 0-0, so we can't infer from point score.
-            # Use the fact that game_score changed to figure out who won
             point_winner = point_server  # default: assume server held
         else:
             winner_side = infer_point_winner(prev_point_score, point_score, server_str)
@@ -160,9 +159,36 @@ def build_observations_from_events(
 
         prev_point_score = point_score if event_type == "point" else None
 
-        # Parse games-in-set directly from game_score column
-        p1_games, p2_games = _parse_score(ev.get("game_score", "0 - 0"))
+        # Parse scores
         p1_sets, p2_sets = _parse_score(ev.get("set_score", "0 - 0"))
+        p1_games, p2_games = _parse_score(ev.get("game_score", "0 - 0"))
+
+        # Fix stale game scores from the API.
+        # The API sometimes reports the previous set's final game score
+        # (e.g. "1 - 6") for several polls after a new set starts.
+        # Detect: if one player has >= 6 games but the game total is
+        # consistent with a completed set, it's stale data.  In an active
+        # set, both can only reach 6+ during a tiebreak (6-6 or 7-6).
+        completed_set = (
+            (p1_games >= 6 and p1_games - p2_games >= 2) or
+            (p2_games >= 6 and p2_games - p1_games >= 2)
+        )
+        if completed_set:
+            # This looks like a final set score, not an in-progress set
+            p1_games, p2_games = prev_games if (p1_sets, p2_sets) == prev_sets else (0, 0)
+
+        # Clamp impossible game counts
+        p1_games = min(p1_games, 7)
+        p2_games = min(p2_games, 7)
+
+        # If game score went backwards significantly within same set,
+        # keep previous (API glitch)
+        if (p1_sets, p2_sets) == prev_sets:
+            if (p1_games + p2_games) < (prev_games[0] + prev_games[1]) - 1:
+                p1_games, p2_games = prev_games
+
+        prev_sets = (p1_sets, p2_sets)
+        prev_games = (p1_games, p2_games)
 
         rows.append({
             "PointServer": point_server,
@@ -393,6 +419,89 @@ def plot_market_around_points(kalshi, score_events, match_info, output_path):
     print(f"Saved {output_path}")
 
 
+def plot_odds_score_vs_market(
+    kalshi, score_events, match_info, pre_match_prob, output_path,
+    window: int = 5,
+):
+    """Plot market vs odds+score model with a moving average smoothing."""
+    yes_player = match_info.get("kalshi_yes_player", "Yes Player")
+    yes_is_p1 = match_info.get("yes_is_p1", False)
+    p1 = match_info.get("first_player", "Player 1")
+    p2 = match_info.get("second_player", "Player 2")
+
+    point_times = pd.to_datetime(score_events["timestamp"])
+
+    # Compute raw odds+score at each event
+    obs_df = build_observations_from_events(score_events)
+    baseline_s, baseline_r = invert_match_odds(pre_match_prob, best_of=3)
+    raw_probs = []
+    for _, row in obs_df.iterrows():
+        if yes_is_p1:
+            is_yes_serving = row["PointServer"] == 1
+            score_dict = {
+                "s_sets": row["p1_sets"], "r_sets": row["p2_sets"],
+                "s_games": row["p1_games"], "r_games": row["p2_games"],
+                "server_serving": is_yes_serving,
+            }
+        else:
+            is_yes_serving = row["PointServer"] == 2
+            score_dict = {
+                "s_sets": row["p2_sets"], "r_sets": row["p1_sets"],
+                "s_games": row["p2_games"], "r_games": row["p1_games"],
+                "server_serving": is_yes_serving,
+            }
+        raw_probs.append(match_win_probability(
+            baseline_s, baseline_r, score=score_dict, best_of=3,
+        ))
+
+    raw_probs = np.array(raw_probs)
+    smoothed = pd.Series(raw_probs).rolling(window=window, min_periods=1, center=True).mean().values
+
+    market_at_events = [find_market_price_at(kalshi, t) for t in point_times]
+    spread = smoothed - np.array(market_at_events)
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 2]})
+
+    # --- Top: market vs smoothed odds+score ---
+    ax = axes[0]
+    ax.plot(kalshi["timestamp"], kalshi["yes_mid"], linewidth=0.8,
+            color="#f59e0b", alpha=0.7, label="Kalshi Market")
+    ax.plot(point_times, raw_probs, ".", color="#94a3b8", markersize=3,
+            alpha=0.4, label="Odds + Score (raw)")
+    ax.plot(point_times, smoothed, "-", color="#2563eb", linewidth=1.8,
+            label=f"Odds + Score ({window}-pt avg)", zorder=5)
+    ax.axhline(pre_match_prob, color="gray", linestyle="-.", linewidth=0.8,
+               alpha=0.5, label=f"Pre-match ({pre_match_prob:.0%})")
+    ax.axhline(0.5, color="gray", linestyle=":", linewidth=0.5, alpha=0.3)
+
+    ax.set_ylabel(f"P({yes_player} wins)")
+    ax.set_title(f"Market vs Odds + Score (no HMM): {p1} vs {p2}")
+    ax.set_ylim(-0.02, 1.02)
+    ax.legend(loc="upper right", fontsize=9)
+
+    # --- Bottom: spread ---
+    ax = axes[1]
+    ax.fill_between(point_times, spread, 0,
+                    where=spread >= 0,
+                    color="#22c55e", alpha=0.5, interpolate=True, label="Model > Market")
+    ax.fill_between(point_times, spread, 0,
+                    where=spread < 0,
+                    color="#ef4444", alpha=0.5, interpolate=True, label="Model < Market")
+    ax.plot(point_times, spread, color="#333", linewidth=0.8)
+    ax.axhline(0, color="gray", linewidth=0.5)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Smoothed Model - Market")
+    ax.set_title(f"Spread ({window}-pt moving average)")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.tick_params(axis="x", rotation=30)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved {output_path}")
+
+
 def plot_recalibration_comparison(
     kalshi, score_events, model_recal, model_no_recal,
     match_info, pre_match_prob, output_path,
@@ -525,6 +634,10 @@ def main():
     plot_market_around_points(
         kalshi, score_events, match_info,
         os.path.join(FIGURES_DIR, "live_market_events.png"),
+    )
+    plot_odds_score_vs_market(
+        kalshi, score_events, match_info, pre_match_prob,
+        os.path.join(FIGURES_DIR, "live_odds_score_vs_market.png"),
     )
     plot_recalibration_comparison(
         kalshi, score_events, model_probs, model_probs_no_recal,
