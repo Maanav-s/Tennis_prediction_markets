@@ -22,7 +22,9 @@
       "WebFetch(domain:www.coursehero.com)",
       "WebFetch(domain:zenodo.org)",
       "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -m pip install xlrd openpyxl)",
-      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe main.py)"
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe main.py)",
+      "WebFetch(domain:docs.kalshi.com)",
+      "Bash(/c/Users/Maanav/.conda/envs/tennisvenv/python.exe -m pip install cryptography)"
     ]
   }
 }

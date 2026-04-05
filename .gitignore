@@ -4,6 +4,11 @@
 /data/tennis-data-co-uk/*
 !/data/tennis-data-co-uk/.gitkeep
 
+# Scraper data & secrets
+/scraper/data/
+.env
+*.pem
+
 # Model artifacts — tracked in git for version control
 
 # Python
