@@ -1,1 +1,32 @@
-/data/
+# Data - ignore contents but keep folder structure
+/data/Sackmann/*
+!/data/Sackmann/.gitkeep
+/data/tennis-data-co-uk/*
+!/data/tennis-data-co-uk/.gitkeep
+
+# Model artifacts — tracked in git for version control
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

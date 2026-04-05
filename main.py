@@ -1,555 +1,460 @@
-"""
-Markov chain model for predicting tennis match outcomes point-by-point.
-
-State = (server_sets, returner_sets, server_games, returner_games,
-         server_points, returner_points, is_tiebreak)
-
-Trained on Grand Slam men's singles point-by-point data.
-"""
-
-import glob
+import argparse
 import os
-import pickle
-from collections import Counter, defaultdict
 
+import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from dataservice import (
+    load_singles_data,
+    merge_odds_with_matches,
+    train_val_split,
+)
+from model import (
+    build_sequences,
+    create_model,
+    decode,
+    encode_observations,
+    get_model_params,
+    hmm_momentum_adjustment,
+    invert_match_odds,
+    live_win_probability,
+    match_win_probability,
+    predict_proba,
+    score,
+    train,
+    N_CATEGORIES,
+    FIRST_SERVE_FREQUENCY,
+)
+
+PROJECT_DIR = os.path.dirname(__file__)
+MODELS_DIR = os.path.join(PROJECT_DIR, "models")
+MODEL_PATH = os.path.join(MODELS_DIR, "hmm_model.pkl")
+FIGURES_DIR = os.path.join(PROJECT_DIR, "figures")
+
+OBS_LABELS = ["Server Win", "Ace", "Server Loss", "Double Fault"]
+
+
 # ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SEED = 42
-N_SIMULATIONS = 1000
-TRAIN_FRAC = 0.8
-SETS_TO_WIN = 3  # best-of-5
-
-# Absorbing / terminal labels
-SERVER_WINS = "SERVER_WINS"
-RETURNER_WINS = "RETURNER_WINS"
-
-# Tiebreak point cap (scores above this are grouped together)
-TB_POINT_CAP = 7
-
-# ---------------------------------------------------------------------------
-# Data loading
+# Model persistence
 # ---------------------------------------------------------------------------
 
-def load_points() -> pd.DataFrame:
-    """Load all singles point-by-point CSVs into one DataFrame."""
-    pattern = os.path.join(DATA_DIR, "*-points.csv")
-    files = [f for f in glob.glob(pattern)
-             if "doubles" not in f and "mixed" not in f]
-    frames = []
-    for f in sorted(files):
-        df = pd.read_csv(f, dtype=str)
-        frames.append(df)
-    df = pd.concat(frames, ignore_index=True)
+def save_model(model):
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    joblib.dump(model, MODEL_PATH)
+    print(f"Model saved to {MODEL_PATH}")
 
-    # Filter to men's singles.
-    # Newer files use "MS###" suffix for men's singles, "WS###" for women's.
-    # Older files use numeric suffixes: < 2000 = men's, >= 2000 = women's.
-    suffix = df["match_id"].str.split("-").str[-1]
-    is_ms_prefix = suffix.str.startswith("MS")
-    numeric_val = pd.to_numeric(suffix, errors="coerce")
-    is_numeric_mens = numeric_val.notna() & (numeric_val < 2000)
-    df = df[is_ms_prefix | is_numeric_mens].copy()
 
-    # Drop sentinel rows (0X, 0Y)
-    df = df[df["PointNumber"].str.isnumeric()].copy()
+def load_cached_model():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    model = joblib.load(MODEL_PATH)
+    print(f"Model loaded from {MODEL_PATH}")
+    return model
 
-    # Convert numeric columns, dropping rows where these are missing
-    int_cols = ["SetNo", "P1GamesWon", "P2GamesWon", "SetWinner",
-                "GameWinner", "PointNumber", "PointWinner", "PointServer"]
-    for col in int_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=int_cols).copy()
-    for col in int_cols:
-        df[col] = df[col].astype(int)
 
-    df = df.sort_values(["match_id", "PointNumber"]).reset_index(drop=True)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_mens(match_row) -> bool:
+    event = str(match_row.get("event_name", ""))
+    if "Men" in event or event == "event_MS":
+        return True
+    # Fallback: match_num < 2000 = men's in Sackmann data
+    mid = str(match_row.get("match_id", ""))
+    parts = mid.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return int(parts[1]) < 2000
+    return True
+
+
+def _best_of(match_row) -> int:
+    return 5 if _is_mens(match_row) else 3
+
+
+def _first_serve_pct(group) -> float:
+    """Compute 1st-serve percentage from a points group."""
+    if "ServeNumber" not in group.columns:
+        return FIRST_SERVE_FREQUENCY
+    valid = group["ServeNumber"].isin([1, 2])
+    if valid.sum() == 0:
+        return FIRST_SERVE_FREQUENCY
+    return float((group.loc[valid, "ServeNumber"] == 1).mean())
+
+
+# ---------------------------------------------------------------------------
+# Validation — odds-informed
+# ---------------------------------------------------------------------------
+
+def evaluate(model, val_matches, val_points):
+    """Predict match winners using market odds as baseline + HMM momentum."""
+    val_enc = encode_observations(val_points)
+
+    # Only evaluate completed men's matches with known winner AND odds
+    valid_matches = val_matches[
+        val_matches["winner"].isin([1.0, 2.0])
+        & val_matches["implied_p1_prob"].notna()
+    ].copy()
+    valid_ids = set(valid_matches["match_id"])
+    val_enc_valid = val_enc[val_enc["match_id"].isin(valid_ids)]
+
+    results = []
+    grouped = val_enc_valid.groupby("match_id", sort=False)
+    for match_id, group in grouped:
+        match_row = valid_matches[valid_matches["match_id"] == match_id].iloc[0]
+        best_of = _best_of(match_row)
+        implied_prob = match_row["implied_p1_prob"]
+        slam = match_row.get("slam")
+
+        # Odds-only prediction (baseline)
+        odds_pred = 1 if implied_prob > 0.5 else 2
+
+        # Invert odds with surface-specific base rate
+        baseline_s, baseline_r = invert_match_odds(
+            implied_prob, best_of=best_of, slam=slam,
+        )
+
+        # HMM-adjusted prediction using full match observations
+        X_m = group["observation"].values.reshape(-1, 1)
+        posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
+        fsp = _first_serve_pct(group)
+
+        # Use final-point posterior for end-of-match assessment
+        last_idx = len(X_m) - 1
+        is_p1_serving = group["PointServer"].values[-1] == 1
+        hmm_prob = live_win_probability(
+            model, posteriors, last_idx,
+            baseline_s, baseline_r,
+            score={"server_serving": is_p1_serving},
+            best_of=best_of,
+            slam=slam,
+            first_serve_pct=fsp,
+        )
+
+        actual_winner = int(match_row["winner"])
+
+        results.append({
+            "match_id": match_id,
+            "implied_p1_prob": implied_prob,
+            "odds_predicted": odds_pred,
+            "hmm_prob": hmm_prob,
+            "hmm_predicted": 1 if hmm_prob > 0.5 else 2,
+            "actual_winner": actual_winner,
+            "best_of": best_of,
+        })
+
+    df = pd.DataFrame(results)
+    df["odds_correct"] = df["odds_predicted"] == df["actual_winner"]
+    df["hmm_correct"] = df["hmm_predicted"] == df["actual_winner"]
     return df
 
 
-def derive_match_winners(df: pd.DataFrame) -> dict[str, int]:
-    """Return {match_id: winner (1 or 2)} derived from set wins in the points."""
-    set_wins = df[df["SetWinner"].isin([1, 2])].copy()
-    counts = set_wins.groupby(["match_id", "SetWinner"]).size().unstack(fill_value=0)
-    winners = {}
-    for mid, row in counts.iterrows():
-        p1_sets = row.get(1, 0)
-        p2_sets = row.get(2, 0)
-        if p1_sets >= SETS_TO_WIN:
-            winners[mid] = 1
-        elif p2_sets >= SETS_TO_WIN:
-            winners[mid] = 2
-    return winners
-
-
 # ---------------------------------------------------------------------------
-# State computation
+# Visualizations
 # ---------------------------------------------------------------------------
 
-def _normalise_point_score(score_str: str, is_tiebreak: bool) -> str:
-    """Normalise a point score string."""
-    if is_tiebreak:
-        try:
-            v = int(score_str)
-        except (ValueError, TypeError):
-            return score_str
-        return str(min(v, TB_POINT_CAP))
-    return score_str  # "0", "15", "30", "40", "AD"
+def plot_win_prob_evolution(model, val_enc, val_matches):
+    """Plot live P1 win probability evolving point-by-point for a sample match,
+    using market odds as baseline and HMM momentum adjustments."""
+    valid = val_matches[
+        val_matches["winner"].isin([1.0, 2.0])
+        & val_matches["implied_p1_prob"].notna()
+    ]
+    match_lengths = val_enc.groupby("match_id").size()
+    valid_lengths = match_lengths[match_lengths.index.isin(valid["match_id"])]
+    # Pick a long match for an interesting plot
+    target_len = valid_lengths.quantile(0.9)
+    sample_id = (valid_lengths - target_len).abs().idxmin()
+    sample_pts = val_enc[val_enc["match_id"] == sample_id]
+    match_row = valid[valid["match_id"] == sample_id].iloc[0]
 
+    best_of = _best_of(match_row)
+    implied_prob = match_row["implied_p1_prob"]
+    slam = match_row.get("slam")
+    baseline_s, baseline_r = invert_match_odds(
+        implied_prob, best_of=best_of, slam=slam,
+    )
 
-def compute_states_for_match(match_df: pd.DataFrame, match_winner: int):
-    """
-    Yield (state_before_point, state_after_point) for every point in a match.
+    X_m = sample_pts["observation"].values.reshape(-1, 1)
+    posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
+    is_p1_serving = sample_pts["PointServer"].values == 1
 
-    The last point's state_after is the appropriate absorbing state.
-    States are from the server's perspective at each point.
-    """
-    rows = match_df.to_dict("records")
+    # Precompute running 1st-serve percentage
+    serve_nums = sample_pts["ServeNumber"].values if "ServeNumber" in sample_pts.columns else None
 
-    # Pre-compute cumulative sets won at each point.
-    # SetWinner is nonzero on the row where a set ends. The games shown on
-    # that row already reflect the completed game, and P1Score/P2Score reset
-    # to 0. We count set wins *before* the current row to get the score at
-    # the start of each point.
-    p1_sets_cum = []
-    p2_sets_cum = []
-    p1s = 0
-    p2s = 0
-    for r in rows:
-        p1_sets_cum.append(p1s)
-        p2_sets_cum.append(p2s)
-        if r["SetWinner"] == 1:
-            p1s += 1
-        elif r["SetWinner"] == 2:
-            p2s += 1
-
-    def _make_state(idx):
-        r = rows[idx]
-        server = r["PointServer"]  # 1 or 2
-        is_tb = (r["P1GamesWon"] == 6 and r["P2GamesWon"] == 6)
-
-        if server == 1:
-            s_sets, r_sets = p1_sets_cum[idx], p2_sets_cum[idx]
-            s_games, r_games = r["P1GamesWon"], r["P2GamesWon"]
-            s_pts = _normalise_point_score(r["P1Score"], is_tb)
-            r_pts = _normalise_point_score(r["P2Score"], is_tb)
-        else:
-            s_sets, r_sets = p2_sets_cum[idx], p1_sets_cum[idx]
-            s_games, r_games = r["P2GamesWon"], r["P1GamesWon"]
-            s_pts = _normalise_point_score(r["P2Score"], is_tb)
-            r_pts = _normalise_point_score(r["P1Score"], is_tb)
-
-        return (s_sets, r_sets, s_games, r_games, s_pts, r_pts, is_tb)
-
-    for i in range(len(rows)):
-        state_before = _make_state(i)
-
-        if i + 1 < len(rows):
-            state_after = _make_state(i + 1)
-        else:
-            # Last point — determine absorbing state
-            server = rows[i]["PointServer"]
-            if match_winner == server:
-                state_after = SERVER_WINS
+    # Compute live win prob at each point (HMM-adjusted)
+    hmm_probs = []
+    # Also compute odds-only baseline (no momentum) at each point
+    odds_probs = []
+    for i in range(len(sample_pts)):
+        # Running 1st-serve pct up to this point
+        if serve_nums is not None:
+            valid_mask = np.isin(serve_nums[:i + 1], [1, 2])
+            if valid_mask.sum() > 0:
+                fsp = float((serve_nums[:i + 1][valid_mask] == 1).mean())
             else:
-                state_after = RETURNER_WINS
-            # But we also need to know who was serving for mapping back,
-            # so yield the server identity alongside.
-
-        yield state_before, state_after, rows[i]["PointServer"]
-
-
-# ---------------------------------------------------------------------------
-# Transition matrix
-# ---------------------------------------------------------------------------
-
-def build_transitions(df: pd.DataFrame, match_ids: set, winners: dict):
-    """Build transition counts from training matches."""
-    transitions = defaultdict(Counter)
-    serve_points_won = 0
-    serve_points_total = 0
-
-    for mid in sorted(match_ids):
-        if mid not in winners:
-            continue
-        mdf = df[df["match_id"] == mid]
-        for s_before, s_after, server in compute_states_for_match(mdf, winners[mid]):
-            transitions[s_before][s_after] += 1
-
-        # Tally serve point win rate
-        mrows = mdf[mdf["PointWinner"].isin([1, 2]) & mdf["PointServer"].isin([1, 2])]
-        serve_points_won += (mrows["PointWinner"] == mrows["PointServer"]).sum()
-        serve_points_total += len(mrows)
-
-    # Convert to probabilities
-    trans_prob = {}
-    for s_from, counter in transitions.items():
-        total = sum(counter.values())
-        trans_prob[s_from] = {s_to: c / total for s_to, c in counter.items()}
-
-    serve_win_rate = serve_points_won / serve_points_total if serve_points_total else 0.6
-    return trans_prob, serve_win_rate
-
-
-# ---------------------------------------------------------------------------
-# Tennis scoring rules engine (fallback for unseen states)
-# ---------------------------------------------------------------------------
-
-REGULAR_SCORES = ["0", "15", "30", "40"]
-
-def next_state_by_rules(state, server_wins_point: bool):
-    """
-    Given a state tuple and who won the point, return the next state
-    deterministically using tennis rules. Returns a state tuple or an
-    absorbing state string.
-    """
-    s_sets, r_sets, s_games, r_games, s_pts, r_pts, is_tb = state
-
-    if is_tb:
-        return _next_tiebreak(s_sets, r_sets, s_games, r_games,
-                              s_pts, r_pts, server_wins_point)
-    else:
-        return _next_regular(s_sets, r_sets, s_games, r_games,
-                             s_pts, r_pts, server_wins_point)
-
-
-def _advance_set(s_sets, r_sets, server_won_set: bool):
-    """After a set is won, return new state or absorbing."""
-    if server_won_set:
-        s_sets += 1
-        if s_sets >= SETS_TO_WIN:
-            return SERVER_WINS
-    else:
-        r_sets += 1
-        if r_sets >= SETS_TO_WIN:
-            return RETURNER_WINS
-    # New set starts: returner now serves (service alternates from last game)
-    # From the new server's perspective, they are the "server" with 0-0, 0-0.
-    # But since service switches, the current returner becomes the server.
-    # In our state representation, we always orient around the current server,
-    # so the new state is simply (r_sets_new, s_sets_new, 0, 0, "0", "0", False)
-    # because the roles swap.
-    if server_won_set:
-        return (r_sets, s_sets, 0, 0, "0", "0", False)
-    else:
-        return (r_sets, s_sets, 0, 0, "0", "0", False)
-
-
-def _advance_game(s_sets, r_sets, s_games, r_games, server_won_game: bool):
-    """After a game is won (non-tiebreak), return new state."""
-    if server_won_game:
-        s_games += 1
-    else:
-        r_games += 1
-
-    # Check if set is won
-    if s_games >= 6 and s_games - r_games >= 2:
-        return _advance_set(s_sets, r_sets, True)
-    if r_games >= 6 and r_games - s_games >= 2:
-        return _advance_set(s_sets, r_sets, False)
-
-    # Check for tiebreak
-    if s_games == 6 and r_games == 6:
-        # Tiebreak starts; the same server continues for the first point
-        return (s_sets, r_sets, 6, 6, "0", "0", True)
-
-    # Next game: service switches, so swap perspective
-    return (r_sets, s_sets, r_games, s_games, "0", "0", False)
-
-
-def _next_regular(s_sets, r_sets, s_games, r_games, s_pts, r_pts,
-                  server_wins_point: bool):
-    """Next state in a regular (non-tiebreak) game."""
-    if server_wins_point:
-        if s_pts == "0":
-            new_s, new_r = "15", r_pts
-        elif s_pts == "15":
-            new_s, new_r = "30", r_pts
-        elif s_pts == "30":
-            new_s, new_r = "40", r_pts
-        elif s_pts == "40" and r_pts != "40" and r_pts != "AD":
-            # Server wins game
-            return _advance_game(s_sets, r_sets, s_games, r_games, True)
-        elif s_pts == "40" and r_pts == "40":
-            new_s, new_r = "AD", "40"
-        elif s_pts == "40" and r_pts == "AD":
-            new_s, new_r = "40", "40"  # back to deuce
-        elif s_pts == "AD":
-            # Server wins game
-            return _advance_game(s_sets, r_sets, s_games, r_games, True)
+                fsp = FIRST_SERVE_FREQUENCY
         else:
-            new_s, new_r = s_pts, r_pts
-    else:
-        if r_pts == "0":
-            new_s, new_r = s_pts, "15"
-        elif r_pts == "15":
-            new_s, new_r = s_pts, "30"
-        elif r_pts == "30":
-            new_s, new_r = s_pts, "40"
-        elif r_pts == "40" and s_pts != "40" and s_pts != "AD":
-            # Returner wins game (break)
-            return _advance_game(s_sets, r_sets, s_games, r_games, False)
-        elif r_pts == "40" and s_pts == "40":
-            new_s, new_r = "40", "AD"
-        elif r_pts == "40" and s_pts == "AD":
-            new_s, new_r = "40", "40"
-        elif r_pts == "AD":
-            return _advance_game(s_sets, r_sets, s_games, r_games, False)
-        else:
-            new_s, new_r = s_pts, r_pts
+            fsp = FIRST_SERVE_FREQUENCY
 
-    return (s_sets, r_sets, s_games, r_games, new_s, new_r, False)
+        score_dict = {"server_serving": bool(is_p1_serving[i])}
+        hmm_wp = live_win_probability(
+            model, posteriors, i, baseline_s, baseline_r,
+            score=score_dict, best_of=best_of, slam=slam,
+            first_serve_pct=fsp,
+        )
+        odds_wp = match_win_probability(
+            baseline_s, baseline_r, score=score_dict, best_of=best_of,
+        )
+        hmm_probs.append(hmm_wp)
+        odds_probs.append(odds_wp)
 
+    hmm_probs = np.array(hmm_probs)
+    odds_probs = np.array(odds_probs)
 
-def _next_tiebreak(s_sets, r_sets, s_games, r_games, s_pts, r_pts,
-                   server_wins_point: bool):
-    """Next state in a tiebreak game."""
-    sp = int(s_pts)
-    rp = int(r_pts)
+    # Set boundaries
+    set_boundaries = []
+    if "SetNo" in sample_pts.columns:
+        sets = sample_pts["SetNo"].values
+        for i in range(1, len(sets)):
+            if sets[i] != sets[i - 1]:
+                set_boundaries.append(i)
 
-    if server_wins_point:
-        sp += 1
-    else:
-        rp += 1
+    p1_name = match_row.get("player1", "Player 1")
+    p2_name = match_row.get("player2", "Player 2")
+    winner_name = p1_name if int(match_row["winner"]) == 1 else p2_name
 
-    # Check tiebreak win: first to 7, lead by 2
-    if sp >= 7 and sp - rp >= 2:
-        return _advance_set(s_sets, r_sets, True)
-    if rp >= 7 and rp - sp >= 2:
-        return _advance_set(s_sets, r_sets, False)
-
-    # Service changes after 1st point, then every 2 points
-    total_pts = sp + rp
-    # In a tiebreak, service switches after 1 point, then every 2.
-    # Since we track state from server perspective, we need to swap when
-    # service changes. Service changes when total_pts is odd.
-    if total_pts % 2 == 1:
-        # Swap perspective
-        return (r_sets, s_sets, r_games, s_games,
-                str(min(rp, TB_POINT_CAP)), str(min(sp, TB_POINT_CAP)), True)
-    else:
-        return (s_sets, r_sets, s_games, r_games,
-                str(min(sp, TB_POINT_CAP)), str(min(rp, TB_POINT_CAP)), True)
-
-
-# ---------------------------------------------------------------------------
-# Monte Carlo prediction
-# ---------------------------------------------------------------------------
-
-def simulate_once(state, trans_prob, serve_win_rate, rng, max_steps=500):
-    """
-    Simulate from a state to an absorbing state.
-    Returns True if the initial-point server wins the match.
-
-    Since we always track state from the *current* server's perspective,
-    we must also track whether the initial-point server is currently the
-    "server" or "returner" in the state representation. Each time service
-    swaps (detected by the state transition swapping sets/games perspective),
-    we flip our tracking bit.
-    """
-    initial_server_is_server = True  # at the start, initial server = state's server
-    current = state
-
-    for _ in range(max_steps):
-        if current == SERVER_WINS:
-            return initial_server_is_server
-        if current == RETURNER_WINS:
-            return not initial_server_is_server
-
-        if current in trans_prob:
-            targets = list(trans_prob[current].keys())
-            probs = list(trans_prob[current].values())
-            idx = rng.choice(len(targets), p=probs)
-            next_s = targets[idx]
-        else:
-            # Fallback: use serve win rate + rules
-            server_wins = rng.random() < serve_win_rate
-            next_s = next_state_by_rules(current, server_wins)
-
-        # Detect service swap: if next state is a tuple and the sets/games
-        # have been swapped (returner's games became server's games), then
-        # service changed.
-        if isinstance(next_s, tuple) and isinstance(current, tuple):
-            # A service swap is indicated when the sets perspective flips.
-            # We detect this by checking if (s_sets, r_sets) of next ==
-            # (r_sets, s_sets) of current (accounting for no set win).
-            c_s_sets, c_r_sets = current[0], current[1]
-            n_s_sets, n_r_sets = next_s[0], next_s[1]
-            # If sets swapped (and no set was just won/lost):
-            if (n_s_sets == c_r_sets and n_r_sets == c_s_sets
-                    and n_s_sets + n_r_sets == c_s_sets + c_r_sets):
-                initial_server_is_server = not initial_server_is_server
-
-        current = next_s
-
-    # Didn't terminate — use serve win rate as tiebreaker
-    return rng.random() < 0.5
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(hmm_probs, linewidth=1.2, color="#2563eb", label="HMM + Odds (live)")
+    ax.plot(odds_probs, linewidth=1.0, color="#94a3b8", alpha=0.7,
+            linestyle="--", label="Odds only (static baseline)")
+    ax.axhline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+    ax.axhline(implied_prob, color="#f59e0b", linestyle="-.", linewidth=0.8,
+               alpha=0.7, label=f"Pre-match odds ({implied_prob:.0%})")
+    for b in set_boundaries:
+        ax.axvline(b, color="#ef4444", linestyle=":", linewidth=0.8, alpha=0.6)
+    ax.fill_between(range(len(hmm_probs)), hmm_probs, 0.5, alpha=0.1, color="#2563eb")
+    ax.set_xlabel("Point Number")
+    ax.set_ylabel(f"P({p1_name} wins match)")
+    ax.set_title(
+        f"Live Win Probability: {p1_name} vs {p2_name}\n"
+        f"Winner: {winner_name} | {match_row.get('slam', '')} "
+        f"{match_row.get('year', '')} | Pre-match: {p1_name} {implied_prob:.0%}"
+    )
+    ax.set_ylim(-0.02, 1.02)
+    ax.legend(loc="upper right", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIGURES_DIR, "win_prob_evolution.png"), dpi=150)
+    plt.close(fig)
+    print(f"Saved win_prob_evolution.png ({sample_id})")
 
 
-def predict_server_win_prob(state, trans_prob, serve_win_rate,
-                            n_sims=N_SIMULATIONS, rng=None):
-    """P(server at this point wins the match) via Monte Carlo."""
-    if rng is None:
-        rng = np.random.default_rng(SEED)
-    wins = sum(simulate_once(state, trans_prob, serve_win_rate, rng)
-               for _ in range(n_sims))
-    return wins / n_sims
+def plot_hmm_vs_odds(eval_df):
+    """Compare HMM+odds accuracy vs odds-only, with calibration."""
+    df = eval_df.copy()
+    df["p1_won"] = (df["actual_winner"] == 1).astype(int)
 
+    hmm_acc = df["hmm_correct"].mean()
+    odds_acc = df["odds_correct"].mean()
+    baseline_acc = max(df["p1_won"].mean(), 1 - df["p1_won"].mean())
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-def evaluate_matches(df, test_ids, winners, trans_prob, serve_win_rate):
-    """
-    For each point in each test match, predict P(P1 wins).
-    Returns a DataFrame with columns:
-        match_id, point_idx, frac_complete, p1_win_prob, p1_actually_won, server
-    """
-    rng = np.random.default_rng(SEED)
-    # Memoize predictions for each unique state
-    memo = {}
-    results = []
-
-    test_ids_sorted = sorted(tid for tid in test_ids if tid in winners)
-    for i, mid in enumerate(test_ids_sorted):
-        if (i + 1) % 50 == 0:
-            print(f"  Evaluating match {i+1}/{len(test_ids_sorted)} ...")
-        mdf = df[df["match_id"] == mid]
-        p1_won = 1 if winners[mid] == 1 else 0
-        states = list(compute_states_for_match(mdf, winners[mid]))
-        n_points = len(states)
-
-        for j, (s_before, _, server) in enumerate(states):
-            if s_before not in memo:
-                memo[s_before] = predict_server_win_prob(
-                    s_before, trans_prob, serve_win_rate, N_SIMULATIONS, rng
-                )
-            p_server_wins = memo[s_before]
-
-            # Convert to P(P1 wins)
-            if server == 1:
-                p1_prob = p_server_wins
-            else:
-                p1_prob = 1.0 - p_server_wins
-
-            results.append({
-                "match_id": mid,
-                "point_idx": j,
-                "frac_complete": j / max(n_points - 1, 1),
-                "p1_win_prob": p1_prob,
-                "p1_actually_won": p1_won,
-                "server": server,
-            })
-
-    return pd.DataFrame(results)
-
-
-# ---------------------------------------------------------------------------
-# Visualisations
-# ---------------------------------------------------------------------------
-
-def plot_calibration(results: pd.DataFrame, save_dir: str):
-    """Calibration plot: binned predicted probability vs actual outcome."""
-    results = results.copy()
-    results["bin"] = pd.cut(results["p1_win_prob"], bins=10, labels=False)
-    grouped = results.groupby("bin").agg(
-        mean_pred=("p1_win_prob", "mean"),
-        mean_actual=("p1_actually_won", "mean"),
-        count=("p1_win_prob", "size"),
+    # Calibration: bin by implied prob
+    n_bins = 10
+    df["prob_bin"] = pd.cut(df["implied_p1_prob"], bins=n_bins)
+    cal = df.groupby("prob_bin", observed=True).agg(
+        mean_predicted=("implied_p1_prob", "mean"),
+        mean_actual=("p1_won", "mean"),
+        count=("p1_won", "count"),
     ).dropna()
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Perfect calibration")
-    ax.scatter(grouped["mean_pred"], grouped["mean_actual"],
-               s=grouped["count"] / grouped["count"].max() * 300,
-               zorder=3, edgecolors="black", linewidths=0.5)
-    ax.set_xlabel("Predicted P(P1 wins)")
-    ax.set_ylabel("Actual P(P1 wins)")
-    ax.set_title("Calibration Plot")
-    ax.legend()
-    ax.set_xlim(0, 1)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: calibration of market odds
+    ax = axes[0]
+    ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, label="Perfect calibration")
+    ax.scatter(cal["mean_predicted"], cal["mean_actual"], s=cal["count"] * 3,
+               color="#f59e0b", zorder=5, edgecolors="white", linewidth=0.5)
+    ax.plot(cal["mean_predicted"], cal["mean_actual"], color="#f59e0b",
+            linewidth=1.2, label="Market odds calibration")
+    ax.set_xlabel("Market Implied P(Player 1 Wins)")
+    ax.set_ylabel("Actual P(Player 1 Wins)")
+    ax.set_title("Market Odds Calibration")
+    ax.legend(fontsize=9)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+
+    # Right: accuracy comparison
+    ax = axes[1]
+    labels = ["50/50\n(majority)", "Market\nOdds Only", "HMM +\nOdds"]
+    values = [baseline_acc * 100, odds_acc * 100, hmm_acc * 100]
+    colors = ["#94a3b8", "#f59e0b", "#2563eb"]
+    bars = ax.bar(labels, values, color=colors, width=0.5, edgecolor="white")
+    ax.bar_label(bars, fmt="%.1f%%", fontsize=11, padding=3)
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Match Winner Prediction Accuracy")
+    ax.set_ylim(0, 100)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIGURES_DIR, "hmm_vs_odds.png"), dpi=150)
+    plt.close(fig)
+    print(f"Saved hmm_vs_odds.png (odds={odds_acc:.1%}, HMM+odds={hmm_acc:.1%})")
+
+
+def plot_model_states(model):
+    """Visualize the HMM's learned parameters: emissions, transitions, start probs."""
+    params = get_model_params(model)
+    n_states = params["emissionprob"].shape[0]
+    state_labels = [f"State {i}" for i in range(n_states)]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    # 1) Emission probabilities
+    ax = axes[0]
+    x = np.arange(N_CATEGORIES)
+    width = 0.8 / n_states
+    colors = plt.cm.Set2(np.linspace(0, 0.6, n_states))
+    for s in range(n_states):
+        ax.bar(x + s * width, params["emissionprob"][s], width,
+               label=state_labels[s], color=colors[s], edgecolor="white")
+    ax.set_xticks(x + width * (n_states - 1) / 2)
+    ax.set_xticklabels(OBS_LABELS, fontsize=9)
+    ax.set_ylabel("Probability")
+    ax.set_title("Emission Probabilities")
+    ax.legend(fontsize=8)
+
+    # 2) Transition matrix
+    ax = axes[1]
+    im = ax.imshow(params["transmat"], cmap="Blues", vmin=0, vmax=1)
+    for i in range(n_states):
+        for j in range(n_states):
+            v = params["transmat"][i, j]
+            color = "white" if v > 0.5 else "black"
+            ax.text(j, i, f"{v:.3f}", ha="center", va="center", fontsize=10, color=color)
+    ax.set_xticks(range(n_states))
+    ax.set_yticks(range(n_states))
+    ax.set_xticklabels(state_labels, fontsize=9)
+    ax.set_yticklabels(state_labels, fontsize=9)
+    ax.set_xlabel("To State")
+    ax.set_ylabel("From State")
+    ax.set_title("Transition Matrix")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # 3) Start probabilities
+    ax = axes[2]
+    bars = ax.bar(state_labels, params["startprob"], color=colors, edgecolor="white")
+    ax.bar_label(bars, fmt="%.3f", fontsize=10, padding=3)
+    ax.set_ylabel("Probability")
+    ax.set_title("Initial State Distribution")
+    ax.set_ylim(0, 1.1)
+
+    fig.suptitle("HMM Learned Parameters (3 Hidden States)", fontsize=13, y=1.02)
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIGURES_DIR, "model_states.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved model_states.png")
+
+
+def plot_state_timeline(model, val_enc, val_matches):
+    """Show hidden state assignments and momentum over a match."""
+    valid = val_matches[
+        val_matches["winner"].isin([1.0, 2.0])
+        & val_matches["implied_p1_prob"].notna()
+    ]
+    match_lengths = val_enc.groupby("match_id").size()
+    valid_lengths = match_lengths[match_lengths.index.isin(valid["match_id"])]
+    target_len = valid_lengths.quantile(0.75)
+    sample_id = (valid_lengths - target_len).abs().idxmin()
+    sample_pts = val_enc[val_enc["match_id"] == sample_id]
+    match_row = valid[valid["match_id"] == sample_id].iloc[0]
+
+    slam = match_row.get("slam")
+
+    X_m = sample_pts["observation"].values.reshape(-1, 1)
+    _, states = decode(model, X_m, np.array([len(X_m)]))
+    posteriors = predict_proba(model, X_m, np.array([len(X_m)]))
+
+    # Compute momentum adjustment at each point (surface-aware)
+    momentum = np.array([
+        hmm_momentum_adjustment(model, posteriors, i, slam=slam)
+        for i in range(len(X_m))
+    ])
+
+    n_states = model.n_components
+    colors = plt.cm.Set2(np.linspace(0, 0.6, n_states))
+
+    p1_name = match_row.get("player1", "Player 1")
+    p2_name = match_row.get("player2", "Player 2")
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True,
+                             gridspec_kw={"height_ratios": [1, 2, 2]})
+
+    # Top: Viterbi state
+    ax = axes[0]
+    for s in range(n_states):
+        mask = states == s
+        ax.scatter(np.where(mask)[0], np.ones(mask.sum()) * 0.5,
+                   c=[colors[s]], s=8, marker="s", label=f"State {s}")
+    ax.set_yticks([])
+    ax.set_title(f"Hidden State Timeline: {p1_name} vs {p2_name} | "
+                 f"{match_row.get('slam', '')} {match_row.get('year', '')}")
+    ax.legend(loc="upper right", fontsize=8, ncol=n_states)
+
+    # Middle: posterior probabilities stacked
+    ax = axes[1]
+    bottom = np.zeros(len(posteriors))
+    for s in range(n_states):
+        ax.fill_between(range(len(posteriors)), bottom, bottom + posteriors[:, s],
+                        color=colors[s], alpha=0.7, label=f"State {s}")
+        bottom += posteriors[:, s]
+    ax.set_ylabel("P(State)")
+    ax.set_title("Posterior State Probabilities")
     ax.set_ylim(0, 1)
-    ax.set_aspect("equal")
+    ax.legend(loc="upper right", fontsize=8, ncol=n_states)
+
+    # Bottom: momentum adjustment
+    ax = axes[2]
+    ax.fill_between(range(len(momentum)), momentum, 0,
+                    where=momentum >= 0, color="#22c55e", alpha=0.5, label="Hot (server)")
+    ax.fill_between(range(len(momentum)), momentum, 0,
+                    where=momentum < 0, color="#ef4444", alpha=0.5, label="Cold (server)")
+    ax.axhline(0, color="gray", linewidth=0.5)
+    ax.set_xlabel("Point Number")
+    ax.set_ylabel("Momentum \u0394")
+    ax.set_title("HMM Momentum Adjustment (vs Global Average)")
+    ax.legend(loc="upper right", fontsize=8)
+
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "calibration.png"), dpi=150)
+    fig.savefig(os.path.join(FIGURES_DIR, "state_timeline.png"), dpi=150)
     plt.close(fig)
-    print(f"  Saved calibration.png")
+    print(f"Saved state_timeline.png ({sample_id})")
 
 
-def plot_brier_over_time(results: pd.DataFrame, save_dir: str):
-    """Brier score as a function of match progress."""
-    results = results.copy()
-    results["brier"] = (results["p1_win_prob"] - results["p1_actually_won"]) ** 2
-    results["progress_bin"] = pd.cut(results["frac_complete"], bins=20, labels=False)
-    grouped = results.groupby("progress_bin").agg(
-        mean_progress=("frac_complete", "mean"),
-        mean_brier=("brier", "mean"),
-    ).dropna()
+def plot_odds_distribution(eval_df):
+    """Histogram of market-implied probs and HMM-adjusted probs."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(grouped["mean_progress"], grouped["mean_brier"], "o-", color="steelblue")
-    ax.set_xlabel("Match progress (fraction of points played)")
-    ax.set_ylabel("Mean Brier score")
-    ax.set_title("Prediction Accuracy Over Match Progress")
-    ax.axhline(0.25, color="gray", linestyle="--", alpha=0.5, label="Coin-flip baseline")
-    ax.legend()
+    ax = axes[0]
+    ax.hist(eval_df["implied_p1_prob"], bins=30, color="#f59e0b", alpha=0.7,
+            edgecolor="white", linewidth=0.5)
+    ax.axvline(0.5, color="#ef4444", linestyle="--", linewidth=1.2)
+    ax.set_xlabel("Market Implied P(P1 Wins)")
+    ax.set_ylabel("Number of Matches")
+    ax.set_title("Pre-Match Odds Distribution")
+
+    ax = axes[1]
+    ax.hist(eval_df["hmm_prob"], bins=30, color="#2563eb", alpha=0.7,
+            edgecolor="white", linewidth=0.5)
+    ax.axvline(0.5, color="#ef4444", linestyle="--", linewidth=1.2)
+    ax.set_xlabel("HMM + Odds P(P1 Wins)")
+    ax.set_ylabel("Number of Matches")
+    ax.set_title("HMM-Adjusted Probability Distribution")
+
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "brier_over_time.png"), dpi=150)
+    fig.savefig(os.path.join(FIGURES_DIR, "probability_distributions.png"), dpi=150)
     plt.close(fig)
-    print(f"  Saved brier_over_time.png")
-
-
-def plot_match_traces(results: pd.DataFrame, save_dir: str, n_matches=4):
-    """Plot P(P1 wins) over time for a few example test matches."""
-    match_ids = results["match_id"].unique()
-    rng = np.random.default_rng(SEED + 1)
-    chosen = rng.choice(match_ids, size=min(n_matches, len(match_ids)), replace=False)
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    axes = axes.flatten()
-
-    for ax, mid in zip(axes, chosen):
-        mdata = results[results["match_id"] == mid].sort_values("point_idx")
-        won = mdata["p1_actually_won"].iloc[0]
-        ax.plot(mdata["point_idx"], mdata["p1_win_prob"], color="steelblue",
-                linewidth=1)
-        ax.axhline(0.5, color="gray", linestyle="--", alpha=0.4)
-        ax.axhline(won, color="green" if won == 1 else "red",
-                   linestyle=":", alpha=0.6, label=f"P1 {'won' if won else 'lost'}")
-        ax.set_xlabel("Point number")
-        ax.set_ylabel("P(P1 wins)")
-        ax.set_title(mid, fontsize=9)
-        ax.set_ylim(-0.05, 1.05)
-        ax.legend(fontsize=8)
-
-    fig.suptitle("Match Win Probability Traces", fontsize=13)
-    fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "match_traces.png"), dpi=150)
-    plt.close(fig)
-    print(f"  Saved match_traces.png")
-
-
-def plot_prediction_histogram(results: pd.DataFrame, save_dir: str):
-    """Histogram of predicted P(P1 wins) at the first point of each match."""
-    first_points = results[results["point_idx"] == 0]
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.hist(first_points["p1_win_prob"], bins=30, edgecolor="black",
-            color="steelblue", alpha=0.7)
-    ax.set_xlabel("Predicted P(P1 wins) at match start")
-    ax.set_ylabel("Count")
-    ax.set_title("Pre-Match Win Probability Distribution\n(player-agnostic model)")
-    ax.axvline(0.5, color="red", linestyle="--", alpha=0.6)
-    fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "prematch_histogram.png"), dpi=150)
-    plt.close(fig)
-    print(f"  Saved prematch_histogram.png")
+    print("Saved probability_distributions.png")
 
 
 # ---------------------------------------------------------------------------
@@ -557,49 +462,74 @@ def plot_prediction_histogram(results: pd.DataFrame, save_dir: str):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("Loading data ...")
-    df = load_points()
-    print(f"  {len(df):,} points across {df['match_id'].nunique()} men's singles matches")
+    parser = argparse.ArgumentParser(description="Tennis HMM Prediction Model")
+    parser.add_argument(
+        "--retrain", action="store_true",
+        help="Force retraining the model even if a cached version exists",
+    )
+    args = parser.parse_args()
 
-    print("Deriving match winners ...")
-    winners = derive_match_winners(df)
-    print(f"  {len(winners)} complete matches with a winner")
+    # --- Load data ---
+    print("Loading match & point data...")
+    matches, points = load_singles_data()
 
-    # Train/test split
-    all_ids = sorted(winners.keys())
-    rng = np.random.default_rng(SEED)
-    rng.shuffle(all_ids)
-    split = int(len(all_ids) * TRAIN_FRAC)
-    train_ids = set(all_ids[:split])
-    test_ids = set(all_ids[split:])
-    print(f"  Train: {len(train_ids)}  Test: {len(test_ids)}")
+    print("Loading odds & merging...")
+    matches = merge_odds_with_matches(matches)
+    has_odds = matches["implied_p1_prob"].notna().sum()
+    print(f"  Odds joined: {has_odds}/{len(matches)} matches")
 
-    print("Building transition matrix ...")
-    trans_prob, serve_win_rate = build_transitions(df, train_ids, winners)
-    print(f"  {len(trans_prob)} unique states observed")
-    print(f"  Serve win rate: {serve_win_rate:.3f}")
+    # Filter to men's only (ATP odds data)
+    matches["_num"] = matches["match_id"].str.extract(r"-(\d+)$").astype(float)
+    matches = matches[matches["_num"] < 2000].drop(columns=["_num"]).reset_index(drop=True)
+    points_ids = set(matches["match_id"])
+    points = points[points["match_id"].isin(points_ids)].reset_index(drop=True)
+    print(f"  Men's singles: {len(matches)} matches")
 
-    print("Evaluating on test set (this may take a few minutes) ...")
-    results = evaluate_matches(df, test_ids, winners, trans_prob, serve_win_rate)
+    train_matches, val_matches, train_points, val_points = train_val_split(matches, points)
+    print(f"  Train: {len(train_matches)} | Val: {len(val_matches)}")
 
-    # Overall Brier score
-    brier = ((results["p1_win_prob"] - results["p1_actually_won"]) ** 2).mean()
-    print(f"  Overall Brier score: {brier:.4f}  (coin-flip baseline: 0.2500)")
+    # --- Encode ---
+    print("Encoding observations...")
+    train_enc = encode_observations(train_points)
+    val_enc = encode_observations(val_points)
+    X_train, len_train = build_sequences(train_enc)
+    print(f"  Train points: {X_train.shape[0]} | Val points: {len(val_enc)}")
 
-    # Match-level accuracy (did the model's pre-match favourite actually win?)
-    first_pts = results[results["point_idx"] == 0].copy()
-    first_pts["predicted_p1"] = first_pts["p1_win_prob"] >= 0.5
-    first_pts["correct"] = first_pts["predicted_p1"] == first_pts["p1_actually_won"].astype(bool)
-    prematch_acc = first_pts["correct"].mean()
-    print(f"  Pre-match accuracy: {prematch_acc:.3f}")
+    # --- Model ---
+    hmm = None
+    if not args.retrain:
+        hmm = load_cached_model()
 
-    # Save plots
-    save_dir = os.path.dirname(__file__)
-    print("Generating visualisations ...")
-    plot_calibration(results, save_dir)
-    plot_brier_over_time(results, save_dir)
-    plot_match_traces(results, save_dir)
-    plot_prediction_histogram(results, save_dir)
+    if hmm is None:
+        print("Training HMM (3 hidden states)...")
+        hmm = create_model()
+        train(hmm, X_train, len_train)
+        save_model(hmm)
+
+    # --- Log-likelihood ---
+    X_val, len_val = build_sequences(val_enc)
+    train_ll = score(hmm, X_train, len_train)
+    val_ll = score(hmm, X_val, len_val)
+    print(f"  Train LL: {train_ll:.1f} ({train_ll / X_train.shape[0]:.4f}/pt)")
+    print(f"  Val   LL: {val_ll:.1f} ({val_ll / X_val.shape[0]:.4f}/pt)")
+
+    # --- Validation accuracy ---
+    print("Evaluating on validation set...")
+    eval_df = evaluate(hmm, val_matches, val_points)
+    odds_acc = eval_df["odds_correct"].mean()
+    hmm_acc = eval_df["hmm_correct"].mean()
+    print(f"  Matches evaluated: {len(eval_df)}")
+    print(f"  Odds-only accuracy:  {odds_acc:.1%}")
+    print(f"  HMM+Odds accuracy:  {hmm_acc:.1%}")
+
+    # --- Figures ---
+    print("Generating figures...")
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+    plot_model_states(hmm)
+    plot_hmm_vs_odds(eval_df)
+    plot_win_prob_evolution(hmm, val_enc, val_matches)
+    plot_state_timeline(hmm, val_enc, val_matches)
+    plot_odds_distribution(eval_df)
 
     print("Done.")
 
